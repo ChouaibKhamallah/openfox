@@ -200,6 +200,7 @@ export interface TopLevelLoopConfig {
 
 const MAX_TRUNCATION_RETRIES = 3
 const MAX_CONTEXT_LENGTH_RETRIES = 3
+const MAX_COMPACTION_REJECTION_RETRIES = 3
 const OUTPUT_RESERVE_TOKENS = 2048
 
 export async function runTopLevelAgentLoop(
@@ -215,6 +216,7 @@ export async function runTopLevelAgentLoop(
   const retryLimiter: RetryLimiter = createRetryLimiter(config.maxRetriesPerTurn ?? 10)
   let truncationRetryCount = 0
   let contextRetryCount = 0
+  let compactionRejectionCount = 0
   let pendingToolResultTokens = 0
   let returnValueContent: string | undefined
   let returnValueResult: string | undefined
@@ -554,12 +556,24 @@ export async function runTopLevelAgentLoop(
     if (!config.subAgentMetadata) {
       emitLiveTurnStats(turnMetrics, statsIdentity, mode, config.onMessage)
     }
-    sessionManager.setCurrentContextSize(
-      sessionId,
-      result.usage.promptTokens,
-      result.usage.completionTokens,
-      config.subAgentMetadata?.subAgentId,
-    )
+    // A stream that ends without ever sending a usage chunk (seen with some
+    // OpenAI-compatible backends, e.g. on a request the server rejects before
+    // streaming any usage) reports zero tokens here. That zero is not a real
+    // measurement — applying it would stomp the last known-good context size
+    // and can suppress compaction right when it's needed most.
+    if (result.usage.reported !== false) {
+      sessionManager.setCurrentContextSize(
+        sessionId,
+        result.usage.promptTokens,
+        result.usage.completionTokens,
+        config.subAgentMetadata?.subAgentId,
+      )
+    } else {
+      logger.warn('LLM stream completed without usage metrics; keeping last known context size', {
+        sessionId,
+        subAgentId: config.subAgentMetadata?.subAgentId,
+      })
+    }
     pendingToolResultTokens = 0
     currentMaxTokensOverride = undefined
 
@@ -585,6 +599,7 @@ export async function runTopLevelAgentLoop(
       ) {
         appendCompactionPrompt(sessionId, append)
         compacting = true
+        compactionRejectionCount = 0
         continue
       }
     }
@@ -644,6 +659,36 @@ export async function runTopLevelAgentLoop(
 
     if (result.toolCalls.length > 0) {
       if (compacting) {
+        append(
+          createMessageDoneEvent(assistantMsgId, {
+            segments: result.segments,
+          }),
+        )
+
+        if (compactionRejectionCount >= MAX_COMPACTION_REJECTION_RETRIES) {
+          append({
+            type: 'chat.error',
+            data: {
+              error: serverT(
+                {
+                  en: 'Model kept attempting tool calls during compaction after {{count}} corrections; giving up on compaction and continuing with full context',
+                  fr: 'Le modèle a continué à tenter des appels d’outils pendant la compaction après {{count}} corrections ; abandon de la compaction, poursuite avec le contexte complet',
+                },
+                { count: compactionRejectionCount },
+              ),
+              recoverable: true,
+            },
+          })
+          logger.warn('Compaction rejection retry limit exceeded, aborting compaction', {
+            sessionId,
+            attempts: compactionRejectionCount,
+          })
+          compacting = false
+          if (config.initialCompacting) break
+          continue
+        }
+
+        compactionRejectionCount += 1
         const rejectionMsgId = crypto.randomUUID()
         append(
           createMessageStartEvent(

@@ -512,6 +512,142 @@ describe('runTopLevelAgentLoop compaction', () => {
     expect(compactedEvents).toHaveLength(1)
     expect(rebuildCachedContext).toHaveBeenCalledTimes(1)
   })
+
+  it('gives up after a bounded number of corrections instead of looping forever when the model keeps calling tools during compaction', async () => {
+    mockSessionManager = {
+      enterPauseGate: vi.fn().mockResolvedValue('released'),
+      requireSession: vi.fn().mockReturnValue({
+        workdir: '/test',
+        projectId: 'test-project',
+        executionState: null,
+        criteria: [],
+        isRunning: false,
+      }),
+      getEffectiveWorkdir: vi.fn().mockReturnValue('/test'),
+      getProjectWorkdir: vi.fn().mockReturnValue('/test'),
+      getContextState: vi.fn().mockReturnValue({
+        currentTokens: 0,
+        maxTokens: 200000,
+        compactionCount: 0,
+        dangerZone: false,
+        canCompact: false,
+        dynamicContextChanged: false,
+      }),
+      getCurrentModelContext: vi.fn().mockReturnValue(200000),
+      getCurrentModelSettings: vi.fn().mockReturnValue({}),
+      getModelCompactionThreshold: vi.fn().mockReturnValue(undefined),
+      setCurrentContextSize: vi.fn(),
+      getDynamicContextChanged: vi.fn().mockReturnValue(false),
+      setDynamicContextChanged: vi.fn(),
+      getCachedPrompt: vi.fn().mockReturnValue(undefined),
+      setCachedPrompt: vi.fn(),
+      getLspManager: vi.fn(),
+      drainAsapMessages: vi.fn().mockReturnValue([]),
+      getCurrentWindowMessages: vi.fn().mockReturnValue([]),
+      updateMessage: vi.fn(),
+    } as any
+
+    // The model refuses to stop calling tools even though compaction told it to.
+    // Before the fix, every attempt below appended a correction and looped with
+    // no upper bound — this mock would make the test hang forever.
+    ;(consumeStreamGenerator as any).mockResolvedValue({
+      content: '',
+      toolCalls: [{ id: 'call-1', name: 'run_command', arguments: { command: 'ls' } }],
+      segments: [{ type: 'tool_call', toolCallId: 'call-1' }],
+      usage: { promptTokens: 10, completionTokens: 5 },
+      timing: { ttft: 0.1, completionTime: 0.5, tps: 10, prefillTps: 100 },
+      aborted: false,
+      finishReason: 'tool_calls',
+      modelParams: {},
+    })
+
+    const appendMock = vi.fn()
+
+    await runTopLevelAgentLoop(
+      makeConfig({
+        append: appendMock,
+        initialCompacting: true,
+      }),
+      mockTurnMetrics,
+    )
+
+    // Bounded: one initial attempt plus MAX_COMPACTION_REJECTION_RETRIES retries.
+    expect((consumeStreamGenerator as any).mock.calls.length).toBe(4)
+
+    const correctionMessages = appendMock.mock.calls
+      .map(([event]) => event)
+      .filter((event: any) => event?.type === 'message.start' && event.data?.messageKind === 'correction')
+    expect(correctionMessages).toHaveLength(3)
+
+    const errorEvents = appendMock.mock.calls
+      .map(([event]) => event)
+      .filter((event: any) => event?.type === 'chat.error')
+    expect(errorEvents).toHaveLength(1)
+    expect(errorEvents[0].data.recoverable).toBe(true)
+
+    // Each rejected attempt must close its assistant bubble instead of leaving
+    // it stuck in isStreaming — otherwise the next request to the LLM backend
+    // carries an unfinished assistant turn alongside the new one.
+    const doneEvents = appendMock.mock.calls
+      .map(([event]) => event)
+      .filter((event: any) => event?.type === 'message.done')
+    expect(doneEvents.length).toBeGreaterThanOrEqual(4)
+  })
+
+  it('does not overwrite the known context size when the LLM stream never reported usage', async () => {
+    mockSessionManager = {
+      enterPauseGate: vi.fn().mockResolvedValue('released'),
+      requireSession: vi.fn().mockReturnValue({
+        workdir: '/test',
+        projectId: 'test-project',
+        executionState: null,
+        criteria: [],
+        isRunning: false,
+      }),
+      getEffectiveWorkdir: vi.fn().mockReturnValue('/test'),
+      getProjectWorkdir: vi.fn().mockReturnValue('/test'),
+      getContextState: vi.fn().mockReturnValue({
+        currentTokens: 65000,
+        maxTokens: 80128,
+        compactionCount: 0,
+        dangerZone: true,
+        canCompact: true,
+        dynamicContextChanged: false,
+      }),
+      getCurrentModelContext: vi.fn().mockReturnValue(80128),
+      getCurrentModelSettings: vi.fn().mockReturnValue({}),
+      getModelCompactionThreshold: vi.fn().mockReturnValue(undefined),
+      setCurrentContextSize: vi.fn(),
+      getDynamicContextChanged: vi.fn().mockReturnValue(false),
+      setDynamicContextChanged: vi.fn(),
+      getCachedPrompt: vi.fn().mockReturnValue(undefined),
+      setCachedPrompt: vi.fn(),
+      getLspManager: vi.fn(),
+      drainAsapMessages: vi.fn().mockReturnValue([]),
+      getCurrentWindowMessages: vi.fn().mockReturnValue([]),
+      updateMessage: vi.fn(),
+    } as any
+
+    // A stream that completed successfully but whose backend never sent a
+    // usage chunk (e.g. a backend that only reports usage on non-streaming
+    // calls). Before the fix this zero was written straight into session
+    // state, wiping out the real (high) context size and starving compaction
+    // of the signal it needs to trigger.
+    ;(consumeStreamGenerator as any).mockResolvedValueOnce({
+      content: 'done',
+      toolCalls: [],
+      segments: [{ type: 'text', content: 'done' }],
+      usage: { promptTokens: 0, completionTokens: 0, reported: false },
+      timing: { ttft: 0.1, completionTime: 0.5, tps: 10, prefillTps: 100 },
+      aborted: false,
+      finishReason: 'stop',
+      modelParams: {},
+    })
+
+    await runTopLevelAgentLoop(makeConfig(), mockTurnMetrics)
+
+    expect(mockSessionManager.setCurrentContextSize).not.toHaveBeenCalled()
+  })
 })
 
 // ============================================================================
