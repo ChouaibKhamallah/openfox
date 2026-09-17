@@ -411,6 +411,12 @@ export async function runTopLevelAgentLoop(
         subAgentAliases,
         ...(config.retryPatterns ? { retryPatterns: config.retryPatterns } : {}),
         ...(modelSettings && { modelSettings }),
+        // Compaction is extraction/summarization, not multi-step reasoning —
+        // and it runs precisely when the window is nearly full, so its output
+        // budget is already tight. Letting it burn that budget on the
+        // session's normal (possibly high) reasoning effort is how a
+        // compaction call ends up with no tokens left for the actual summary.
+        ...(compacting ? { reasoningEffort: 'low' as const } : {}),
       })
 
       const attemptResult = await consumeStreamGenerator(streamGen, (event) => {
@@ -801,19 +807,32 @@ ${COMPACTION_PROMPT}`,
     }
 
     if (compacting) {
-      const summary = result.content?.trim() || result.thinkingContent?.trim() || ''
+      // Raw thinkingContent is never accepted as the summary: it's unstructured
+      // chain-of-thought, not the requested output, and using it silently
+      // produces a garbled continuation that loses track of prior progress.
+      // A `finishReason === 'length'` truncation is rejected the same way —
+      // a summary cut off mid-sentence is missing whatever came after
+      // (frequently the "next steps" section, since COMPACTION_PROMPT asks
+      // for that last), which is just as harmful as no summary at all.
+      const truncated = result.finishReason === 'length'
+      const summary = !truncated ? (result.content?.trim() ?? '') : ''
       if (!summary) {
         append({
           type: 'chat.error',
           data: {
-            error: serverT({
-              en: 'Compaction produced empty summary, continuing with full context',
-              fr: 'La compaction a produit un résumé vide, poursuite avec le contexte complet',
-            }),
+            error: truncated
+              ? serverT({
+                  en: 'Compaction summary was truncated (ran out of output budget), continuing with full context',
+                  fr: 'Le résumé de compaction a été tronqué (budget de sortie épuisé), poursuite avec le contexte complet',
+                })
+              : serverT({
+                  en: 'Compaction produced empty summary, continuing with full context',
+                  fr: 'La compaction a produit un résumé vide, poursuite avec le contexte complet',
+                }),
             recoverable: true,
           },
         })
-        logger.warn('Compaction produced empty summary, continuing', { sessionId })
+        logger.warn('Compaction produced unusable summary, continuing', { sessionId, truncated })
         compacting = false
         if (config.initialCompacting) break
         continue

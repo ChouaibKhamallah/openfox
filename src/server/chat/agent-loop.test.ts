@@ -715,6 +715,112 @@ describe('runTopLevelAgentLoop compaction', () => {
       .find((event: any) => event?.type === 'message.start' && event.data?.messageKind === 'auto-prompt')
     expect(compactionPrompt?.data).toMatchObject({ subAgentId: 'sub-1', subAgentType: 'explorer' })
   })
+
+  function makeCompactionSessionManager(): SessionManager {
+    return {
+      enterPauseGate: vi.fn().mockResolvedValue('released'),
+      requireSession: vi.fn().mockReturnValue({
+        workdir: '/test',
+        projectId: 'test-project',
+        executionState: null,
+        criteria: [],
+        isRunning: false,
+      }),
+      getEffectiveWorkdir: vi.fn().mockReturnValue('/test'),
+      getProjectWorkdir: vi.fn().mockReturnValue('/test'),
+      getContextState: vi.fn().mockReturnValue({
+        currentTokens: 0,
+        maxTokens: 200000,
+        compactionCount: 0,
+        dangerZone: false,
+        canCompact: false,
+        dynamicContextChanged: false,
+      }),
+      getCurrentModelContext: vi.fn().mockReturnValue(200000),
+      getCurrentModelSettings: vi.fn().mockReturnValue({}),
+      getModelCompactionThreshold: vi.fn().mockReturnValue(undefined),
+      setCurrentContextSize: vi.fn(),
+      getDynamicContextChanged: vi.fn().mockReturnValue(false),
+      setDynamicContextChanged: vi.fn(),
+      getCachedPrompt: vi.fn().mockReturnValue(undefined),
+      setCachedPrompt: vi.fn(),
+      getLspManager: vi.fn(),
+      drainAsapMessages: vi.fn().mockReturnValue([]),
+      getCurrentWindowMessages: vi.fn().mockReturnValue([]),
+      updateMessage: vi.fn(),
+    } as any
+  }
+
+  it('requests a low reasoning effort for the compaction LLM call', async () => {
+    // Regression test: compaction shares the session's normal reasoning
+    // effort by default. On a reasoning model that can eat the whole (already
+    // tight, since the window is nearly full) output budget just thinking,
+    // that leaves nothing for the actual summary — see the empty-content and
+    // truncation tests below for what that produces.
+    mockSessionManager = makeCompactionSessionManager()
+
+    await runTopLevelAgentLoop(makeConfig({ initialCompacting: true }), mockTurnMetrics)
+
+    const callArgs = (streamLLMPure as any).mock.calls[0]?.[0]
+    expect(callArgs.reasoningEffort).toBe('low')
+  })
+
+  it('does not use raw thinkingContent as the compaction summary when content is empty', async () => {
+    // Regression test: a reasoning model can spend its whole output budget
+    // inside <think> and return empty final content. Falling back to
+    // thinkingContent silently turned that raw, unstructured chain-of-thought
+    // into the "summary" — producing a garbled continuation that loses track
+    // of prior progress and drives the next window to re-explore from
+    // scratch instead of picking up where the last one left off.
+    mockSessionManager = makeCompactionSessionManager()
+
+    ;(consumeStreamGenerator as any).mockResolvedValue({
+      content: '',
+      thinkingContent: 'Let me organize what I understand from this session: 1. This is a continuation...',
+      toolCalls: [],
+      segments: [{ type: 'thinking', content: 'Let me organize...' }],
+      usage: { promptTokens: 10, completionTokens: 5 },
+      timing: { ttft: 0.1, completionTime: 0.5, tps: 10, prefillTps: 100 },
+      aborted: false,
+      finishReason: 'stop',
+      modelParams: {},
+    })
+
+    const appendMock = vi.fn()
+    await runTopLevelAgentLoop(makeConfig({ append: appendMock, initialCompacting: true }), mockTurnMetrics)
+
+    const events = appendMock.mock.calls.map(([event]) => event)
+    expect(events.some((e: any) => e?.type === 'context.compacted')).toBe(false)
+    expect(events.some((e: any) => e?.type === 'chat.error')).toBe(true)
+  })
+
+  it('rejects a truncated compaction summary instead of using the partial output', async () => {
+    // Regression test: when the compaction call hits its (tight) output
+    // budget mid-generation, the backend reports finishReason: 'length' and
+    // content is non-empty but cut off — often mid-sentence, and frequently
+    // missing the "next steps" section entirely since COMPACTION_PROMPT asks
+    // for that last. A truncated summary is rejected the same way an empty
+    // one is, instead of being silently accepted as "good enough".
+    mockSessionManager = makeCompactionSessionManager()
+
+    ;(consumeStreamGenerator as any).mockResolvedValue({
+      content: '# Work Notes Summary\n\n## Files read\n- `src/ecole_ai',
+      toolCalls: [],
+      segments: [{ type: 'text', content: '# Work Notes Summary...' }],
+      usage: { promptTokens: 10, completionTokens: 5 },
+      timing: { ttft: 0.1, completionTime: 0.5, tps: 10, prefillTps: 100 },
+      aborted: false,
+      finishReason: 'length',
+      modelParams: {},
+    })
+
+    const appendMock = vi.fn()
+    await runTopLevelAgentLoop(makeConfig({ append: appendMock, initialCompacting: true }), mockTurnMetrics)
+
+    const events = appendMock.mock.calls.map(([event]) => event)
+    expect(events.some((e: any) => e?.type === 'context.compacted')).toBe(false)
+    expect(events.some((e: any) => e?.type === 'chat.error')).toBe(true)
+  })
 })
 
 // ============================================================================
