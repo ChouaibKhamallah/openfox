@@ -802,6 +802,43 @@ ${COMPACTION_PROMPT}`,
         void drainQueue(sessionManager, sessionId, append, onMessage)
       }
 
+      // Proactive compaction check using a PROJECTED token count (current +
+      // the tool results just added, before they've gone into a prompt).
+      // The regular check below only runs after the *next* LLM call reports
+      // its real promptTokens — but a single tool batch (e.g. a few large
+      // file reads) can jump the context from comfortably under threshold to
+      // dangerously over it in one hop. Waiting for that call to confirm the
+      // overshoot means compaction finally triggers with the window already
+      // nearly full and almost no output budget left for its own summary
+      // (see the finishReason:'length' rejection above). Catching the
+      // overshoot here, before that oversized call ever goes out, is what
+      // keeps compaction's own headroom guarantee meaningful in practice.
+      if (!compacting) {
+        const contextState = sessionManager.getContextState(sessionId)
+        const { shouldCompact, appendCompactionPrompt } = await import('../context/compactor.js')
+        const projectedTokens = config.subAgentMetadata
+          ? (sessionManager.getSubAgentContextTokens?.(config.subAgentMetadata.subAgentId) ?? 0) +
+            pendingToolResultTokens
+          : contextState.currentTokens + pendingToolResultTokens
+        const compactionWindow = config.subAgentMetadata
+          ? sessionManager.getCurrentModelContext(sessionId, config.mode)
+          : contextState.maxTokens
+        if (
+          shouldCompact(
+            projectedTokens,
+            compactionWindow,
+            sessionManager.getModelCompactionThreshold(sessionId, config.mode) ??
+              runtimeConfig.context.compactionThreshold,
+          )
+        ) {
+          appendCompactionPrompt(sessionId, append, config.subAgentMetadata)
+          compacting = true
+          compactionRejectionCount = 0
+          retryLimiter.reset()
+          continue
+        }
+      }
+
       retryLimiter.reset()
       continue
     }

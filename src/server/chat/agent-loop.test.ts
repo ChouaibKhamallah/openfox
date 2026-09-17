@@ -821,6 +821,75 @@ describe('runTopLevelAgentLoop compaction', () => {
     expect(events.some((e: any) => e?.type === 'context.compacted')).toBe(false)
     expect(events.some((e: any) => e?.type === 'chat.error')).toBe(true)
   })
+
+  it('triggers compaction right after an oversized tool batch instead of waiting for the next (oversized) LLM call', async () => {
+    // Regression test: the compaction-threshold check only ran once per LLM
+    // call, using that call's own promptTokens. A single tool batch (a couple
+    // of large file reads) can jump currentTokens from comfortably under
+    // threshold to well over it in one hop — the overshoot was only detected
+    // AFTER the next (now oversized) call, by which point compaction itself
+    // had almost no output budget left. This asserts compaction fires
+    // immediately once the projected tokens (current + just-added tool
+    // results) cross the threshold, without a second full-size LLM call
+    // happening first.
+    const toolRegistry = {
+      tools: [],
+      definitions: [],
+      execute: vi.fn().mockResolvedValue({
+        success: true,
+        output: 'x'.repeat(40000), // 16 + 10000 = 10016 estimated tokens
+        durationMs: 0,
+        truncated: false,
+      }),
+    } as any
+
+    mockSessionManager = makeCompactionSessionManager()
+    // 80128-token window (matches the real ctx-size=80000 deployment).
+    // headroom = min(15K, 80128*0.3) = 15K -> ceiling ~81.3% -> trigger ~65136.
+    // currentTokens=60000 is below that on its own; +10016 from the tool
+    // batch projects to 70016, which is over it.
+    ;(mockSessionManager.getContextState as any).mockReturnValue({
+      currentTokens: 60000,
+      maxTokens: 80128,
+      compactionCount: 0,
+      dangerZone: false,
+      canCompact: true,
+      dynamicContextChanged: false,
+    })
+    ;(mockSessionManager.getCurrentModelContext as any).mockReturnValue(80128)
+    ;(mockSessionManager.getModelCompactionThreshold as any).mockReturnValue(0.85)
+
+    // Iteration 1: model requests a tool call; the default beforeEach mock
+    // (content: 'compaction summary', finishReason: 'stop') answers every
+    // call after that — which is exactly what the compaction turn itself
+    // should receive.
+    ;(consumeStreamGenerator as any).mockResolvedValueOnce({
+      content: '',
+      toolCalls: [{ id: 'call-1', name: 'read_file', arguments: { path: 'a.ts' } }],
+      segments: [],
+      usage: { promptTokens: 10, completionTokens: 5 },
+      timing: { ttft: 0.1, completionTime: 0.5, tps: 10, prefillTps: 100 },
+      aborted: false,
+      finishReason: 'tool_calls',
+      modelParams: { maxTokens: 10000 },
+    })
+
+    const appendMock = vi.fn()
+    await runTopLevelAgentLoop(makeConfig({ append: appendMock, getToolRegistry: () => toolRegistry }), mockTurnMetrics)
+
+    // 3 LLM calls: the tool-calling turn, the compaction turn it triggers
+    // right afterward, then the natural continuation turn in the fresh
+    // window — never a 4th+ call, which would mean an extra oversized normal
+    // turn slipped in before compaction finally fired. The mocked responses
+    // report a trivially small promptTokens (10), so the old (non-proactive)
+    // check — which only trusts a completed call's own reported promptTokens
+    // — would never see this overshoot at all; only the projection-based
+    // check added here can catch it.
+    expect((streamLLMPure as any).mock.calls.length).toBe(3)
+    const events = appendMock.mock.calls.map(([event]) => event)
+    expect(events.some((e: any) => e?.type === 'message.start' && e.data?.messageKind === 'auto-prompt')).toBe(true)
+    expect(events.some((e: any) => e?.type === 'context.compacted')).toBe(true)
+  })
 })
 
 // ============================================================================
