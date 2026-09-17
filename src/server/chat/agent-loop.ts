@@ -288,6 +288,17 @@ export async function runTopLevelAgentLoop(
 
     const toolRegistry = config.getToolRegistry()
     const currentWindowMessageOptions = getCurrentWindowMessageOptions(sessionId)
+    // Sub-agent-tagged variant for any message injected into the conversation
+    // (corrections, compaction prompts, nudges). Without this tag such
+    // messages are attributed to the top-level scope, so a sub-agent's own
+    // conversation (built strictly by subAgentId) never sees them — see the
+    // appendCompactionPrompt docstring for the failure mode this causes.
+    const injectedMessageOptions = {
+      ...(currentWindowMessageOptions ?? {}),
+      ...(config.subAgentMetadata
+        ? { subAgentId: config.subAgentMetadata.subAgentId, subAgentType: config.subAgentMetadata.subAgentType }
+        : {}),
+    }
 
     // ---- LLM round with automatic failure retry ----
     // Case 1: a request fails before any content → retry the same request with
@@ -324,7 +335,7 @@ export async function runTopLevelAgentLoop(
           : CONTINUE_PROMPT
         append(
           createMessageStartEvent(continueMsgId, 'user', continueContent, {
-            ...(currentWindowMessageOptions ?? {}),
+            ...injectedMessageOptions,
             isSystemGenerated: true,
             messageKind: 'correction',
           }),
@@ -354,14 +365,7 @@ export async function runTopLevelAgentLoop(
       const ensureAssistantMessage = () => {
         if (assistantMessageStarted) return
         assistantMessageStarted = true
-        append(
-          createMessageStartEvent(assistantMsgId, 'assistant', undefined, {
-            ...(currentWindowMessageOptions ?? {}),
-            ...(config.subAgentMetadata
-              ? { subAgentId: config.subAgentMetadata.subAgentId, subAgentType: config.subAgentMetadata.subAgentType }
-              : {}),
-          }),
-        )
+        append(createMessageStartEvent(assistantMsgId, 'assistant', undefined, injectedMessageOptions))
       }
 
       const contextState = sessionManager.getContextState(sessionId)
@@ -429,7 +433,7 @@ export async function runTopLevelAgentLoop(
         const continueMsgId = crypto.randomUUID()
         append(
           createMessageStartEvent(continueMsgId, 'user', CONTINUE_AFTER_STREAM_ERROR_PROMPT, {
-            ...(currentWindowMessageOptions ?? {}),
+            ...injectedMessageOptions,
             isSystemGenerated: true,
             messageKind: 'correction',
           }),
@@ -521,7 +525,7 @@ export async function runTopLevelAgentLoop(
       const matchMessage = `Pattern "${result.patternMatch.pattern}" matched — auto-retry #${retryLimiter.count()}`
       append(
         createMessageStartEvent(matchMsgId, 'user', matchMessage, {
-          ...(currentWindowMessageOptions ?? {}),
+          ...injectedMessageOptions,
           isSystemGenerated: true,
           messageKind: 'correction',
         }),
@@ -597,7 +601,7 @@ export async function runTopLevelAgentLoop(
             runtimeConfig.context.compactionThreshold,
         )
       ) {
-        appendCompactionPrompt(sessionId, append)
+        appendCompactionPrompt(sessionId, append, config.subAgentMetadata)
         compacting = true
         compactionRejectionCount = 0
         continue
@@ -635,7 +639,7 @@ export async function runTopLevelAgentLoop(
             'user',
             'Continue your previous response exactly where you left off.',
             {
-              ...(currentWindowMessageOptions ?? {}),
+              ...injectedMessageOptions,
               isSystemGenerated: true,
             },
           ),
@@ -698,7 +702,7 @@ export async function runTopLevelAgentLoop(
 
 ${COMPACTION_PROMPT}`,
             {
-              ...(currentWindowMessageOptions ?? {}),
+              ...injectedMessageOptions,
               isSystemGenerated: true,
               messageKind: 'correction',
             },
@@ -871,12 +875,9 @@ ${COMPACTION_PROMPT}`,
             'user',
             'You must call return_value with a summary of your findings before finishing. Call return_value now.',
             {
-              ...(currentWindowMessageOptions ?? {}),
+              ...injectedMessageOptions,
               isSystemGenerated: true,
               messageKind: 'correction',
-              ...(config.subAgentMetadata
-                ? { subAgentId: config.subAgentMetadata.subAgentId, subAgentType: config.subAgentMetadata.subAgentType }
-                : {}),
             },
           ),
         )

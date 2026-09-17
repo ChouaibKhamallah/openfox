@@ -15,15 +15,22 @@ import { getCurrentWindowMessageOptions } from '../events/index.js'
  * Append the compaction prompt to the event store.
  * Used by both auto-compaction (threshold-gated, in agent-loop.ts) and
  * manual compaction (always appended, in ws/server.ts).
+ *
+ * `subAgent` must be passed when compacting a sub-agent's own context —
+ * without it the prompt is tagged as a top-level message, so the sub-agent's
+ * own conversation (built by subAgentId) never sees it and keeps ending in
+ * back-to-back assistant turns, which backends reject outright.
  */
 export function appendCompactionPrompt(
   sessionId: string,
   append: (event: import('../events/types.js').TurnEvent) => void,
+  subAgent?: { subAgentId: string; subAgentType: string },
 ): void {
   const compactPromptMsgId = crypto.randomUUID()
   append(
     createMessageStartEvent(compactPromptMsgId, 'user', COMPACTION_PROMPT, {
       ...(getCurrentWindowMessageOptions(sessionId) ?? {}),
+      ...(subAgent ? { subAgentId: subAgent.subAgentId, subAgentType: subAgent.subAgentType } : {}),
       isSystemGenerated: true,
       messageKind: 'auto-prompt',
       metadata: { type: 'compaction', name: 'Compaction', color: '#64748b' },

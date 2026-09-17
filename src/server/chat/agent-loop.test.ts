@@ -648,6 +648,73 @@ describe('runTopLevelAgentLoop compaction', () => {
 
     expect(mockSessionManager.setCurrentContextSize).not.toHaveBeenCalled()
   })
+
+  it('tags the compaction prompt with the sub-agent id when compacting a sub-agent context', async () => {
+    // Regression test: appendCompactionPrompt used to omit subAgentId, so the
+    // prompt landed in the top-level conversation instead of the sub-agent's
+    // own — the sub-agent's own history (built strictly by subAgentId) never
+    // saw it and kept appending back-to-back assistant turns with no user
+    // turn between them, which backends reject with "Cannot have 2 or more
+    // assistant messages at the end of the list."
+    mockSessionManager = {
+      enterPauseGate: vi.fn().mockResolvedValue('released'),
+      requireSession: vi.fn().mockReturnValue({
+        workdir: '/test',
+        projectId: 'test-project',
+        executionState: null,
+        criteria: [],
+        isRunning: false,
+      }),
+      getEffectiveWorkdir: vi.fn().mockReturnValue('/test'),
+      getProjectWorkdir: vi.fn().mockReturnValue('/test'),
+      getContextState: vi.fn().mockReturnValue({
+        currentTokens: 0,
+        maxTokens: 200000,
+        compactionCount: 0,
+        dangerZone: false,
+        canCompact: false,
+        dynamicContextChanged: false,
+      }),
+      getCurrentModelContext: vi.fn().mockReturnValue(80128),
+      // Above the (80128 * 0.5) threshold for the first few calls (covering
+      // the iteration that triggers compaction), then low so the loop
+      // doesn't re-trigger compaction forever once the (mocked) summary
+      // "succeeds".
+      getSubAgentContextTokens: vi.fn().mockImplementation(
+        (() => {
+          let calls = 0
+          return () => (calls++ < 3 ? 60000 : 100)
+        })(),
+      ),
+      getCurrentModelSettings: vi.fn().mockReturnValue({}),
+      getModelCompactionThreshold: vi.fn().mockReturnValue(0.5),
+      setCurrentContextSize: vi.fn(),
+      getDynamicContextChanged: vi.fn().mockReturnValue(false),
+      setDynamicContextChanged: vi.fn(),
+      getCachedPrompt: vi.fn().mockReturnValue(undefined),
+      setCachedPrompt: vi.fn(),
+      getLspManager: vi.fn(),
+      drainAsapMessages: vi.fn().mockReturnValue([]),
+      getCurrentWindowMessages: vi.fn().mockReturnValue([]),
+      updateMessage: vi.fn(),
+    } as any
+
+    const appendMock = vi.fn()
+
+    await runTopLevelAgentLoop(
+      makeConfig({
+        append: appendMock,
+        subAgentMetadata: { subAgentId: 'sub-1', subAgentType: 'explorer' },
+        breakOnReturnValue: true,
+      }),
+      mockTurnMetrics,
+    )
+
+    const compactionPrompt = appendMock.mock.calls
+      .map(([event]) => event)
+      .find((event: any) => event?.type === 'message.start' && event.data?.messageKind === 'auto-prompt')
+    expect(compactionPrompt?.data).toMatchObject({ subAgentId: 'sub-1', subAgentType: 'explorer' })
+  })
 })
 
 // ============================================================================

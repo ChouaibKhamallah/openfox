@@ -1,5 +1,31 @@
-import { describe, expect, it } from 'vitest'
-import { shouldCompact } from './compactor.js'
+import { describe, expect, it, vi } from 'vitest'
+import { appendCompactionPrompt, shouldCompact } from './compactor.js'
+import type { TurnEvent } from '../events/types.js'
+
+vi.mock('../events/store.js', () => ({
+  getEventStore: vi.fn().mockReturnValue({ getEvents: vi.fn().mockReturnValue([]) }),
+}))
+
+describe('appendCompactionPrompt', () => {
+  it('tags the prompt with the sub-agent when compacting a sub-agent context', () => {
+    const events: TurnEvent[] = []
+    appendCompactionPrompt('session-1', (e) => events.push(e), {
+      subAgentId: 'sub-1',
+      subAgentType: 'explorer',
+    })
+
+    const start = events.find((e) => e.type === 'message.start')
+    expect(start?.data).toMatchObject({ subAgentId: 'sub-1', subAgentType: 'explorer' })
+  })
+
+  it('omits the sub-agent tag for top-level compaction', () => {
+    const events: TurnEvent[] = []
+    appendCompactionPrompt('session-1', (e) => events.push(e))
+
+    const start = events.find((e) => e.type === 'message.start')
+    expect(start?.data).not.toHaveProperty('subAgentId')
+  })
+})
 
 describe('context compactor helpers', () => {
   it('decides when compaction should happen', () => {
